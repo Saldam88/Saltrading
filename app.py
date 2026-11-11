@@ -1,16 +1,20 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json, os
-from datetime import datetime, timezone
+import json
+import os
 
-st.set_page_config(page_title="AI Crypto Trader — Demo", page_icon="📊", layout="wide")
+st.set_page_config(page_title="AI Crypto Trader Demo", page_icon="📊")
 st.title("📊 AI Crypto Trader — Demo")
-st.caption("Paper trading בלבד · nessun denaro reale · dati pubblici di mercato")
+st.caption("Paper trading | nessun denaro reale | dati pubblici di mercato")
 
 STARTING_CASH = 20.0
 STATE_FILE = "portfolio.json"
-SYMBOLS = ["BTCEUR", "ETHEUR", "BNBEUR", "SOLEUR", "XRPEUR"]
+COINS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana"
+}
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -19,138 +23,152 @@ def load_state():
                 return json.load(f)
         except Exception:
             pass
-    return {"cash": STARTING_CASH, "positions": {}, "trades": [], "last_update": None}
+    return {"cash": STARTING_CASH, "positions": {}, "history": []}
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
 
-@st.cache_data(ttl=45)
-def get_market():
-    url = "https://api.binance.com/api/v3/ticker/price"
-    r = requests.get(url, timeout=12)
-    r.raise_for_status()
-    rows = r.json()
-    return {x["symbol"]: float(x["price"]) for x in rows if x["symbol"] in SYMBOLS}
-
-@st.cache_data(ttl=90)
-def get_candles(symbol):
-    url = "https://api.binance.com/api/v3/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": "1h", "limit": 60}, timeout=12)
+@st.cache_data(ttl=60)
+def get_market_data():
+    ids = ",".join(COINS.values())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=10)
     r.raise_for_status()
     data = r.json()
-    return pd.DataFrame([{"close": float(x[4]), "volume": float(x[5])} for x in data])
+    
+    prices = {}
+    changes = {}
+    for sym, cg_id in COINS.items():
+        if cg_id in data:
+            prices[sym] = float(data[cg_id].get("usd", 0.0))
+            changes[sym] = float(data[cg_id].get("usd_24h_change", 0.0))
+    return prices, changes
 
-def signal(symbol):
-    df = get_candles(symbol)
-    if len(df) < 30:
-        return "ATTENDI", 0
-    close = df["close"]
-    fast = close.rolling(7).mean().iloc[-1]
-    slow = close.rolling(25).mean().iloc[-1]
-    momentum = (close.iloc[-1] / close.iloc[-8] - 1) * 100
-    # Regola trasparente e deterministica: non è una previsione AI né una garanzia.
-    if fast > slow and momentum > 0.4:
-        return "POTENZIALE ACQUISTO", momentum
-    if fast < slow and momentum < -0.4:
-        return "DEBOLE", momentum
-    return "ATTENDI", momentum
+def classify_signal(change_24h):
+    if change_24h >= 2.5:
+        return "POTENZIALE RIALZO", "green"
+    elif change_24h <= -2.5:
+        return "DEBOLE", "red"
+    return "ATTESA", "gray"
 
-def execute_cycle(state, prices):
-    # Demo volutamente conservativa: una sola posizione, importo fisso, stop simulato.
+def execute_simulation(state, prices, changes):
+    trades = []
+    # Gestione posizioni aperte
     for sym in list(state["positions"].keys()):
         pos = state["positions"][sym]
-        price = prices.get(sym)
-        if price is None:
+        curr_p = prices.get(sym)
+        if not curr_p:
             continue
-        change = (price / pos["entry"] - 1) * 100
-        if change <= -3.0 or change >= 5.0:
-            proceeds = pos["qty"] * price
-            pnl = proceeds - pos["cost"]
+        entry_p = pos["entry_price"]
+        pnl_pct = ((curr_p - entry_p) / entry_p) * 100
+        
+        # Stop loss a -1% o Take profit a +2%
+        if pnl_pct <= -1.0 or pnl_pct >= 2.0:
+            proceeds = pos["qty"] * curr_p
             state["cash"] += proceeds
-            state["trades"].append({
-                "ora": datetime.now(timezone.utc).isoformat(),
-                "simbolo": sym, "azione": "VENDITA DEMO",
-                "prezzo": price, "pnl_eur": round(pnl, 4),
-                "motivo": "stop -3%" if change <= -3.0 else "target +5%"
+            trades.append(f"Chiusa posizione {sym}: PnL {pnl_pct:+.2f}%")
+            state["history"].append({
+                "action": "SELL",
+                "symbol": sym,
+                "price": curr_p,
+                "pnl_pct": pnl_pct
             })
             del state["positions"][sym]
-
-    if not state["positions"] and state["cash"] >= 2.0:
-        for sym in SYMBOLS:
-            try:
-                label, mom = signal(sym)
-            except Exception:
-                continue
-            if label == "POTENZIALE ACQUISTO" and sym in prices:
-                cost = 2.0
-                qty = cost / prices[sym]
-                state["cash"] -= cost
-                state["positions"][sym] = {"entry": prices[sym], "qty": qty, "cost": cost}
-                state["trades"].append({
-                    "ora": datetime.now(timezone.utc).isoformat(),
-                    "simbolo": sym, "azione": "ACQUISTO DEMO",
-                    "prezzo": prices[sym], "pnl_eur": 0.0,
-                    "motivo": f"media 7h sopra 25h; momentum {mom:.2f}%"
-                })
-                break
-    state["last_update"] = datetime.now(timezone.utc).isoformat()
-    return state
+            
+    # Apertura nuove posizioni se c'è liquidità (max 2 posizioni)
+    if len(state["positions"]) < 2 and state["cash"] >= 2.0:
+        for sym, chg in changes.items():
+            if sym not in state["positions"] and chg >= 2.5:
+                curr_p = prices.get(sym)
+                if curr_p and curr_p > 0:
+                    invest = min(2.0, state["cash"])
+                    qty = invest / curr_p
+                    state["cash"] -= invest
+                    state["positions"][sym] = {
+                        "qty": qty,
+                        "entry_price": curr_p
+                    }
+                    trades.append(f"Aperta posizione {sym} a {curr_p:.2f} $")
+                    state["history"].append({
+                        "action": "BUY",
+                        "symbol": sym,
+                        "price": curr_p
+                    })
+                    break
+    save_state(state)
+    return trades
 
 state = load_state()
-col_a, col_b, col_c = st.columns(3)
-try:
-    prices = get_market()
-    equity = state["cash"] + sum(p["qty"] * prices.get(s, p["entry"]) for s,p in state["positions"].items())
-    pnl_total = equity - STARTING_CASH
-    col_a.metric("Capitale iniziale", "€20,00")
-    col_b.metric("Patrimonio demo", f"€{equity:.2f}", f"{pnl_total:+.2f} €")
-    col_c.metric("Liquidità", f"€{state['cash']:.2f}")
-    st.info("I prezzi sono pubblici e possono avere ritardi o indisponibilità. I risultati sono simulati.")
-    if st.button("▶ Esegui un ciclo di analisi", type="primary"):
-        state = execute_cycle(state, prices)
-        save_state(state)
-        st.rerun()
-    st.subheader("Mercato")
-    market_rows = []
-    for sym in SYMBOLS:
-        try:
-            label, mom = signal(sym)
-        except Exception:
-            label, mom = "DATI NON DISPONIBILI", 0
-        market_rows.append({"Asset": sym.replace("EUR",""), "Prezzo (€)": prices.get(sym), "Segnale tecnico": label, "Momentum 7h": f"{mom:+.2f}%"})
-    st.dataframe(pd.DataFrame(market_rows), use_container_width=True, hide_index=True)
-    st.subheader("Posizioni aperte")
-    if state["positions"]:
-        rows=[]
-        for sym,p in state["positions"].items():
-            mark=prices.get(sym,p["entry"])
-            rows.append({"Asset":sym,"Ingresso":p["entry"],"Prezzo":mark,"Quantità":p["qty"],"P/L non realizzato (€)":p["qty"]*mark-p["cost"]})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    else:
-        st.write("Nessuna posizione aperta.")
-    st.subheader("Storico operazioni")
-    if state["trades"]:
-        st.dataframe(pd.DataFrame(state["trades"]).iloc[::-1], use_container_width=True, hide_index=True)
-    else:
-        st.write("Ancora nessuna operazione.")
-    st.caption(f"Ultimo ciclo: {state.get('last_update') or 'mai'} · UTC")
-except Exception as e:
-    st.error(f"Non riesco a recuperare i dati di mercato: {e}")
-    st.warning("Riprova più tardi. Nessuna operazione reale viene eseguita.")
 
-with st.expander("⚙️ Controlli e limiti"):
-    st.write("""
-    - Capitale simulato iniziale: 20 €.
-    - Acquisto simulato: 2 € per operazione.
-    - Una posizione alla volta.
-    - Uscita simulata: stop -3% oppure obiettivo +5%.
-    - Segnale basato su media mobile 7h/25h e momentum; non è una vera IA predittiva.
-    - Il pulsante esegue un singolo ciclo: non è un servizio H24 e non lavora in background quando la pagina è inattiva.
-    - Commissioni, spread, slippage, tasse e rischio di esecuzione non sono ancora modellati in modo completo.
+col_btn, _ = st.columns([1, 2])
+with col_btn:
+    refresh = st.button("🔄 Analizza mercato ed Esegui")
+
+try:
+    prices, changes = get_market_data()
+    
+    # Valore portafoglio
+    pos_val = sum(pos["qty"] * prices.get(sym, pos["entry_price"]) for sym, pos in state["positions"].items())
+    total_val = state["cash"] + pos_val
+    delta = total_val - STARTING_CASH
+    
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Capitale Totale", f"{total_val:.2f} $", f"{delta:+.2f} $")
+    m2.metric("Liquidità Residua", f"{state['cash']:.2f} $")
+    m3.metric("Posizioni Aperte", f"{len(state['positions'])} / 2")
+    
+    if refresh:
+        results = execute_simulation(state, prices, changes)
+        if results:
+            for r in results:
+                st.info(r)
+        else:
+            st.write("Nessuna operazione necessaria in questo ciclo.")
+            
+    st.subheader("Mercati monitorati")
+    market_rows = []
+    for sym in COINS:
+        p = prices.get(sym, 0.0)
+        c = changes.get(sym, 0.0)
+        sig, _ = classify_signal(c)
+        market_rows.append({"Asset": sym, "Prezzo ($)": f"{p:.2f}", "Var. 24h": f"{c:+.2f}%", "Segnale": sig})
+    st.dataframe(pd.DataFrame(market_rows), use_container_width=True)
+    
+    st.subheader("Posizioni correnti")
+    if state["positions"]:
+        pos_rows = []
+        for sym, d in state["positions"].items():
+            curr = prices.get(sym, d["entry_price"])
+            pnl = ((curr - d["entry_price"]) / d["entry_price"]) * 100
+            pos_rows.append({
+                "Asset": sym,
+                "Prezzo Carico ($)": f"{d['entry_price']:.2f}",
+                "Prezzo Attuale ($)": f"{curr:.2f}",
+                "PnL": f"{pnl:+.2f}%"
+            })
+        st.dataframe(pd.DataFrame(pos_rows), use_container_width=True)
+    else:
+        st.write("Nessuna posizione aperta al momento.")
+        
+except Exception as e:
+    st.error(f"Errore nel recupero dati: {e}")
+    st.warning("Riprova tra poco.")
+
+with st.expander("⚙️ Controlli e Regole"):
+    st.markdown("""
+    - **Capitale iniziale:** 20.00 $
+    - **Importo ordine:** 2.00 $
+    - **Posizioni contemporanee massime:** 2
+    - **Stop loss:** -1.0% | **Take profit:** +2.0%
+    - **Trigger acquisto:** Variazione 24h >= +2.5%
     """)
 
-if st.button("♻️ Azzera simulazione e riparti da 20 €"):
-    state = {"cash": STARTING_CASH, "positions": {}, "trades": [], "last_update": None}
-    save_state(state)
+if st.button("♻️ Azzera simulazione e riparti da 20 $"):
+    if os.path.exists(STATE_FILE):
+        os.remove(STATE_FILE)
     st.rerun()
